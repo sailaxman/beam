@@ -54,6 +54,8 @@ import org.slf4j.LoggerFactory;
 @RunWith(JUnit4.class)
 public class GroupIntoBatchesTest implements Serializable {
   private static final int BATCH_SIZE = 5;
+  private static final int STALE_TIME = 1000;
+
   private static final long EVEN_NUM_ELEMENTS = 10;
   private static final long ODD_NUM_ELEMENTS = 11;
   private static final int ALLOWED_LATENESS = 0;
@@ -89,7 +91,7 @@ public class GroupIntoBatchesTest implements Serializable {
     PCollection<KV<String, Iterable<String>>> collection =
         pipeline
             .apply("Input data", Create.of(data))
-            .apply(GroupIntoBatches.ofSize(BATCH_SIZE))
+            .apply(GroupIntoBatches.of(BATCH_SIZE, STALE_TIME))
             // set output coder
             .setCoder(KvCoder.of(StringUtf8Coder.of(), IterableCoder.of(StringUtf8Coder.of())));
     PAssert.that("Incorrect batch size in one or more elements", collection)
@@ -123,7 +125,7 @@ public class GroupIntoBatchesTest implements Serializable {
     PCollection<KV<String, Iterable<String>>> collection =
         pipeline
             .apply("Input data", Create.of(createTestData(ODD_NUM_ELEMENTS)))
-            .apply(GroupIntoBatches.ofSize(BATCH_SIZE))
+            .apply(GroupIntoBatches.of(BATCH_SIZE, STALE_TIME))
             // set output coder
             .setCoder(KvCoder.of(StringUtf8Coder.of(), IterableCoder.of(StringUtf8Coder.of())));
     PAssert.that("Incorrect batch size in one or more elements", collection)
@@ -207,7 +209,7 @@ public class GroupIntoBatchesTest implements Serializable {
 
     PCollection<KV<String, Iterable<String>>> outputCollection =
         inputCollection
-            .apply(GroupIntoBatches.ofSize(BATCH_SIZE))
+            .apply(GroupIntoBatches.of(BATCH_SIZE, STALE_TIME))
             .setCoder(KvCoder.of(StringUtf8Coder.of(), IterableCoder.of(StringUtf8Coder.of())));
 
     // elements have the same key and collection is divided into windows,
@@ -257,4 +259,96 @@ public class GroupIntoBatchesTest implements Serializable {
             });
     pipeline.run().waitUntilFinish();
   }
+
+    @Test
+    @Category({
+            NeedsRunner.class,
+            UsesTimersInParDo.class,
+            UsesTestStream.class,
+            UsesStatefulParDo.class
+    })
+    public void testInStreamingModeStale() {
+        Instant startInstant = new Instant(0);
+        TestStream.Builder<KV<String, String>> streamBuilder =
+                TestStream.create(KvCoder.of(StringUtf8Coder.of(), StringUtf8Coder.of()))
+                        .advanceWatermarkTo(startInstant);
+        int timestampInterval = 50;
+        long offset = 1L;
+        for (KV<String, String> element : data) {
+            streamBuilder =
+                    streamBuilder.addElements(
+                            TimestampedValue.of(
+                                    element,
+                                    startInstant.plus(Duration.millis(offset * timestampInterval))))
+                            .advanceProcessingTime(Duration.millis(timestampInterval+1));
+            offset++;
+        }
+        final long windowDuration = 500;
+        TestStream<KV<String, String>> stream =
+                streamBuilder
+                        .advanceWatermarkTo(startInstant.plus(Duration.millis(500)))
+                        .advanceWatermarkTo(startInstant.plus(Duration.millis(500)))
+                        .advanceWatermarkToInfinity();
+
+
+        PCollection<KV<String, String>> inputCollection =
+                pipeline
+                        .apply(stream)
+                        .apply(
+                                Window.<KV<String, String>>into(
+                                        FixedWindows.of(Duration.millis(windowDuration)))
+                                        .withAllowedLateness(Duration.millis(ALLOWED_LATENESS)));
+        inputCollection.apply(
+                ParDo.of(
+                        new DoFn<KV<String, String>, Void>() {
+                            @ProcessElement
+                            public void processElement(ProcessContext c, BoundedWindow window) {
+                                LOG.debug(
+                                        "*** ELEMENT: ({},{}) *** with timestamp %s in window %s",
+                                        c.element().getKey(),
+                                        c.element().getValue(),
+                                        c.timestamp().toString(),
+                                        window.toString());
+                            }
+                        }));
+
+        PCollection<KV<String, Iterable<String>>> outputCollection =
+                inputCollection
+                        .apply(GroupIntoBatches.of(200, 200))
+                        .setCoder(KvCoder.of(StringUtf8Coder.of(), IterableCoder.of(StringUtf8Coder.of())));
+
+        // elements have the same key and collection is divided into windows,
+        // so Count.perKey values are the number of elements in windows
+        PCollection<KV<String, Long>> countOutput =
+                outputCollection.apply(
+                        "Count elements in windows after applying GroupIntoBatches", Count.perKey());
+
+        PAssert.that("Wrong number of elements in windows after GroupIntoBatches", countOutput)
+                .satisfies(
+                        input -> {
+                            Iterator<KV<String, Long>> inputIterator = input.iterator();
+
+                            long count0 = inputIterator.next().getValue();
+                            assertEquals("Wrong number of elements in first window", 3, count0);
+                            long count1 = inputIterator.next().getValue();
+                            assertEquals("Wrong number of elements in second window", 1, count1);
+                            return null;
+                        });
+
+        PAssert.that("Incorrect output collection after GroupIntoBatches", outputCollection)
+                .satisfies(
+                        input -> {
+                            Iterator<KV<String, Iterable<String>>> inputIterator = input.iterator();
+                            int size0 = Iterables.size(inputIterator.next().getValue());
+                            assertEquals("Wrong first element batch Size", 4, size0);
+                            int size1 = Iterables.size(inputIterator.next().getValue());
+                            assertEquals("Wrong second element batch Size", 4, size1);
+                            int size2 = Iterables.size(inputIterator.next().getValue());
+                            assertEquals("Wrong third element batch Size", 1, size2);
+                            int size3 = Iterables.size(inputIterator.next().getValue());
+                            assertEquals("Wrong fourth element batch Size", 1, size3);
+                            return null;
+                        });
+        pipeline.run().waitUntilFinish();
+    }
 }

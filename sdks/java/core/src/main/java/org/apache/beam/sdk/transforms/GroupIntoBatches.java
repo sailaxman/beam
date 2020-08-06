@@ -71,18 +71,23 @@ public class GroupIntoBatches<K, InputT>
     extends PTransform<PCollection<KV<K, InputT>>, PCollection<KV<K, Iterable<InputT>>>> {
 
   private final long batchSize;
+  private final long staleTime;
 
-  private GroupIntoBatches(long batchSize) {
+  private GroupIntoBatches(long batchSize, long staleTime) {
     this.batchSize = batchSize;
+    this.staleTime = staleTime;
   }
 
-  public static <K, InputT> GroupIntoBatches<K, InputT> ofSize(long batchSize) {
-    return new GroupIntoBatches<>(batchSize);
+  public static <K, InputT> GroupIntoBatches<K, InputT> of(long batchSize, long staleTime) {
+    return new GroupIntoBatches<>(batchSize, staleTime);
   }
 
   /** Returns the size of the batch. */
   public long getBatchSize() {
     return batchSize;
+  }
+  public long getStaleTime() {
+    return staleTime;
   }
 
   @Override
@@ -97,7 +102,7 @@ public class GroupIntoBatches<K, InputT>
     Coder<InputT> valueCoder = (Coder<InputT>) inputCoder.getCoderArguments().get(1);
 
     return input.apply(
-        ParDo.of(new GroupIntoBatchesDoFn<>(batchSize, allowedLateness, keyCoder, valueCoder)));
+        ParDo.of(new GroupIntoBatchesDoFn<>(batchSize, staleTime, allowedLateness, keyCoder, valueCoder)));
   }
 
   @VisibleForTesting
@@ -106,14 +111,19 @@ public class GroupIntoBatches<K, InputT>
 
     private static final Logger LOG = LoggerFactory.getLogger(GroupIntoBatchesDoFn.class);
     private static final String END_OF_WINDOW_ID = "endOFWindow";
+    private static final String STALE_TIMER_ID = "staleTimer";
     private static final String BATCH_ID = "batch";
     private static final String NUM_ELEMENTS_IN_BATCH_ID = "numElementsInBatch";
     private static final String KEY_ID = "key";
     private final long batchSize;
+    private final long staleTime;
     private final Duration allowedLateness;
 
     @TimerId(END_OF_WINDOW_ID)
     private final TimerSpec timer = TimerSpecs.timer(TimeDomain.EVENT_TIME);
+
+    @TimerId(STALE_TIMER_ID)
+    private final TimerSpec staleSpec = TimerSpecs.timer(TimeDomain.PROCESSING_TIME);
 
     @StateId(BATCH_ID)
     private final StateSpec<BagState<InputT>> batchSpec;
@@ -128,10 +138,12 @@ public class GroupIntoBatches<K, InputT>
 
     GroupIntoBatchesDoFn(
         long batchSize,
+        long staleTime,
         Duration allowedLateness,
         Coder<K> inputKeyCoder,
         Coder<InputT> inputValueCoder) {
       this.batchSize = batchSize;
+      this.staleTime = staleTime;
       this.allowedLateness = allowedLateness;
       this.batchSpec = StateSpecs.bag(inputValueCoder);
       this.numElementsInBatchSpec =
@@ -157,6 +169,7 @@ public class GroupIntoBatches<K, InputT>
     @ProcessElement
     public void processElement(
         @TimerId(END_OF_WINDOW_ID) Timer timer,
+        @TimerId(STALE_TIMER_ID) Timer staleTimer,
         @StateId(BATCH_ID) BagState<InputT> batch,
         @StateId(NUM_ELEMENTS_IN_BATCH_ID) CombiningState<Long, long[], Long> numElementsInBatch,
         @StateId(KEY_ID) ValueState<K> key,
@@ -176,6 +189,10 @@ public class GroupIntoBatches<K, InputT>
       // blind add is supported with combiningState
       numElementsInBatch.add(1L);
       Long num = numElementsInBatch.read();
+      // set a stale time on Processing Timer to emit batch every n millis
+      if (num == 1) {
+        staleTimer.offset(Duration.millis(staleTime)).setRelative();
+      }
       if (num % prefetchFrequency == 0) {
         // prefetch data and modify batch state (readLater() modifies this)
         batch.readLater();
@@ -184,6 +201,21 @@ public class GroupIntoBatches<K, InputT>
         LOG.debug("*** END OF BATCH *** for window {}", window.toString());
         flushBatch(receiver, key, batch, numElementsInBatch);
       }
+    }
+
+    @OnTimer(STALE_TIMER_ID)
+    public void onStaleCallback(
+            OutputReceiver<KV<K, Iterable<InputT>>> receiver,
+            @Timestamp Instant timestamp,
+            @StateId(KEY_ID) ValueState<K> key,
+            @StateId(BATCH_ID) BagState<InputT> batch,
+            @StateId(NUM_ELEMENTS_IN_BATCH_ID) CombiningState<Long, long[], Long> numElementsInBatch,
+            BoundedWindow window) {
+      LOG.debug(
+              "*** Stale Timer *** for timer timestamp {} in windows {}",
+              timestamp,
+              window.toString());
+      flushBatch(receiver, key, batch, numElementsInBatch);
     }
 
     @OnTimer(END_OF_WINDOW_ID)
